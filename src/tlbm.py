@@ -10,73 +10,38 @@ import matplotlib.pyplot as plt
 import matplotlib.animation as animation
 from matplotlib import cm
 import time
-from dataclasses import dataclass
 from typing import Tuple, Dict, Optional
-
-
-@dataclass
-class TLBMConfig:
-    """Configuration for TLBM simulation"""
-    # Physical parameters
-    Ra: float = 1e4          # Rayleigh number
-    Pr: float = 0.71         # Prandtl number
-    T_hot: float = 1.0       # Hot boundary temperature
-    T_cold: float = 0.0      # Cold boundary temperature
-
-    # Derived parameters (computed in __post_init__)
-    niu: float = None        # Kinematic viscosity
-    kappa: float = None      # Thermal diffusivity
-    gravity: float = None    # Gravity magnitude
-    beta: float = 0.5        # Thermal expansion coefficient - reduced for stability
-
-    # Resource parameters
-    resource_kappa: float = 0.05  # Resource diffusivity - increased for stability
-    cell_resistance: float = 0.5   # Flow resistance from cells
-
-    def __post_init__(self):
-        """Compute derived parameters from Ra and Pr"""
-        # For a domain of height H=1 in lattice units
-        # Ra = g*beta*DT*H^3/(niu*kappa)
-        # Pr = niu/kappa
-
-        # Choose kappa and compute niu
-        self.kappa = 0.1
-        self.niu = self.Pr * self.kappa
-
-        # Use stable gravity value instead of computing from Ra
-        # Computing from Ra gives unrealistically high values that cause instability
-        # For Ra=2e4, the computed gravity would be ~142, which is way too high
-        # Use a small value similar to successful implementations
-        # Common LBM implementations use gravity values around 0.001-0.01
-        self.gravity = 0.005  # Moderate value for visible convection
-
-        # Compute effective Ra for display
-        DT = self.T_hot - self.T_cold
-        H = 1.0  # Height in lattice units
-        Ra_effective = self.gravity * self.beta * DT * H**3 / (self.niu * self.kappa)
-
-        print(f"Using gravity: {self.gravity:.6f}")
-        print(f"Effective Ra: {Ra_effective:.1e} (requested: {self.Ra:.1e})")
+from .config import TLBMConfig
 
 
 class TLBM_MLX:
     """MLX-based Thermal Lattice Boltzmann Method solver"""
 
     def __init__(self, nx: int, ny: int, config: TLBMConfig, debug: bool = True):
-        self.nx = nx
-        self.ny = ny
+        # Store physical domain size
+        self.nx_phys = nx
+        self.ny_phys = ny
+        # Total size includes ghost nodes
+        self.nx = nx + 2  # Add ghost layer on each side
+        self.ny = ny + 2  # Add ghost layer on each side
+        
+        # Define slices for physical domain
+        self.phys_x = slice(1, self.nx - 1)
+        self.phys_y = slice(1, self.ny - 1)
+        
         self.config = config
         self.debug = debug
         self.step_counter = 0
 
-        # Compute relaxation times
-        self.tau_f = 3.0 * config.niu + 0.5
-        self.tau_t = 3.0 * config.kappa + 0.5
-        self.tau_r = 3.0 * config.resource_kappa + 0.5
+        # Use pre-computed relaxation times from config
+        self.tau_f = config.tau_f
+        self.tau_t = config.tau_g  # tau_t is for temperature
+        self.tau_r = config.tau_r
 
         if self.debug:
             print(f"\nTLBM Initialization:")
-            print(f"  Grid: {nx}×{ny}")
+            print(f"  Physical grid: {self.nx_phys}×{self.ny_phys}")
+            print(f"  Total grid (with ghost): {self.nx}×{self.ny}")
             print(f"  Relaxation times: τ_f={self.tau_f:.3f}, τ_t={self.tau_t:.3f}, τ_r={self.tau_r:.3f}")
             print(f"  Gravity: {config.gravity:.3f}")
             print(f"  Ra={config.Ra:.1e}, Pr={config.Pr:.2f}")
@@ -86,20 +51,19 @@ class TLBM_MLX:
         self.e = mx.array([[0, 0], [1, 0], [0, 1], [-1, 0], [0, -1],
                           [1, 1], [-1, 1], [-1, -1], [1, -1]], dtype=mx.int32)
 
-        # Initialize distribution functions
-        self.f = mx.zeros((nx, ny, 9), dtype=mx.float32)  # Fluid
-        self.g = mx.zeros((nx, ny, 9), dtype=mx.float32)  # Temperature
-        self.r = mx.zeros((nx, ny, 9), dtype=mx.float32)  # Resource
+        # Initialize distribution functions (with ghost nodes)
+        self.f = mx.zeros((self.nx, self.ny, 9), dtype=mx.float32)  # Fluid
+        self.g = mx.zeros((self.nx, self.ny, 9), dtype=mx.float32)  # Temperature
+        self.r = mx.zeros((self.nx, self.ny, 9), dtype=mx.float32)  # Resource
 
-        # Macroscopic fields
-        self.rho = mx.ones((nx, ny), dtype=mx.float32)
-        self.vel = mx.zeros((nx, ny, 2), dtype=mx.float32)
-        self.T = mx.zeros((nx, ny), dtype=mx.float32)
-        self.P = mx.zeros((nx, ny), dtype=mx.float32)  # Resource concentration
+        # Macroscopic fields (with ghost nodes)
+        self.rho = mx.ones((self.nx, self.ny), dtype=mx.float32)
+        self.vel = mx.zeros((self.nx, self.ny, 2), dtype=mx.float32)
+        self.T = mx.zeros((self.nx, self.ny), dtype=mx.float32)
+        self.P = mx.zeros((self.nx, self.ny), dtype=mx.float32)  # Resource concentration
 
-        # Auxiliary fields
-        self.cell_presence = mx.zeros((nx, ny), dtype=mx.float32)
-        self.mask = mx.zeros((nx, ny), dtype=mx.float32)  # Solid boundaries
+        # Auxiliary fields (physical domain only)
+        self.cell_presence = mx.zeros((self.nx_phys, self.ny_phys), dtype=mx.float32)
 
         # Pre-compute streaming indices for efficiency
         self._compute_streaming_indices()
@@ -111,30 +75,32 @@ class TLBM_MLX:
         self._compile_functions()
 
     def _compute_streaming_indices(self):
-        """Pre-compute indices for streaming operation"""
-        # Create index arrays
+        """Pre-compute indices for streaming operation with ghost nodes"""
+        # Create index arrays for entire domain including ghost
         idx_x = mx.arange(self.nx)[:, None]
         idx_y = mx.arange(self.ny)[None, :]
 
         # For streaming, we need to know where each site gets its values FROM
-        # This is the opposite of the velocity direction
+        # With ghost nodes, ALL cells have valid neighbors
         self.stream_src_idx = []
         for k in range(9):
             # Source indices (where values come FROM)
             # This is the opposite direction of the velocity
-            src_x = (idx_x - self.e[k, 0]) % self.nx  # Periodic in x
+            # Ghost nodes handle periodicity in x naturally
+            src_x = (idx_x - self.e[k, 0]) % self.nx  
             src_y = idx_y - self.e[k, 1]
-
-            # Handle y boundaries (non-periodic)
+            
+            # Clamp src_y to valid range [0, ny-1]
+            # Ghost nodes at y=0 and y=ny-1 will handle boundary conditions
             src_y = mx.clip(src_y, 0, self.ny - 1)
-
+            
             # Flatten indices for gather operation
             flat_idx = src_x * self.ny + src_y
             self.stream_src_idx.append(flat_idx.flatten())
 
         # Verify streaming indices
         if self.debug:
-            print("\nVerifying streaming indices...")
+            print("\nVerifying streaming indices (with ghost nodes)...")
             for k in range(9):
                 idx_min = int(mx.min(self.stream_src_idx[k]))
                 idx_max = int(mx.max(self.stream_src_idx[k]))
@@ -146,31 +112,45 @@ class TLBM_MLX:
 
     def _initialize_fields(self):
         """Initialize temperature gradient and equilibrium distributions"""
+        # Initialize physical domain only
         # Temperature field: linear gradient from hot (bottom) to cold (top)
-        y_coords = mx.arange(self.ny)[None, :] / (self.ny - 1)
-        self.T = self.config.T_hot * (1 - y_coords) + self.config.T_cold * y_coords
-        self.T = mx.broadcast_to(self.T, (self.nx, self.ny))
+        y_coords = mx.arange(self.ny_phys)[None, :] / (self.ny_phys - 1)
+        T_phys = self.config.T_hot * (1 - y_coords) + self.config.T_cold * y_coords
+        T_phys = mx.broadcast_to(T_phys, (self.nx_phys, self.ny_phys))
         
         # Add small random perturbation to trigger instability
-        perturbation = 0.01 * (mx.random.uniform(shape=(self.nx, self.ny)) - 0.5)
-        self.T = self.T + perturbation
+        perturbation = 0.01 * (mx.random.uniform(shape=(self.nx_phys, self.ny_phys)) - 0.5)
+        T_phys = T_phys + perturbation
+        
+        # Set physical domain temperature
+        self.T[self.phys_x, self.phys_y] = T_phys
 
-        # Resource field: source at bottom
-        self.P = mx.zeros((self.nx, self.ny))
-        self.P[:, 0] = 1.0  # Source at bottom
+        # Resource field: source at bottom of physical domain
+        self.P[self.phys_x, 1] = 1.0  # Bottom of physical domain (y=1)
 
-        # Initialize distributions at equilibrium
+        # Initialize density in physical domain
+        self.rho[self.phys_x, self.phys_y] = 1.0
+
+        # Initialize distributions at equilibrium for physical domain
         for k in range(9):
-            self.f[:, :, k] = self.w[k] * self.rho
-            self.g[:, :, k] = self.w[k] * self.T
-            self.r[:, :, k] = self.w[k] * self.P
+            self.f[self.phys_x, self.phys_y, k] = self.w[k] * self.rho[self.phys_x, self.phys_y]
+            self.g[self.phys_x, self.phys_y, k] = self.w[k] * self.T[self.phys_x, self.phys_y]
+            self.r[self.phys_x, self.phys_y, k] = self.w[k] * self.P[self.phys_x, self.phys_y]
+        
+        # Initialize ghost nodes (will be set by boundary conditions)
+        self._apply_ghost_boundaries()
 
         if self.debug:
-            print("\nInitial state check:")
-            print(f"  T range: [{float(mx.min(self.T)):.3f}, {float(mx.max(self.T)):.3f}]")
-            print(f"  P range: [{float(mx.min(self.P)):.3f}, {float(mx.max(self.P)):.3f}]")
-            print(f"  ρ range: [{float(mx.min(self.rho)):.3f}, {float(mx.max(self.rho)):.3f}]")
-            print(f"  f sum: {float(mx.sum(self.f)):.3f} (should be {self.nx * self.ny})")
+            print("\nInitial state check (physical domain):")
+            T_phys_check = self.T[self.phys_x, self.phys_y]
+            P_phys_check = self.P[self.phys_x, self.phys_y]
+            rho_phys_check = self.rho[self.phys_x, self.phys_y]
+            f_phys_check = self.f[self.phys_x, self.phys_y, :]
+            print(f"  T range: [{float(mx.min(T_phys_check)):.3f}, {float(mx.max(T_phys_check)):.3f}]")
+            print(f"  P range: [{float(mx.min(P_phys_check)):.3f}, {float(mx.max(P_phys_check)):.3f}]")
+            print(f"  ρ range: [{float(mx.min(rho_phys_check)):.3f}, {float(mx.max(rho_phys_check)):.3f}]")
+            print(f"  f sum: {float(mx.sum(f_phys_check)):.3f} (should be {self.nx_phys * self.ny_phys})")
+            print(f"  Total f sum (with ghost): {float(mx.sum(self.f)):.3f}")
 
     def _compile_functions(self):
         """Compile main functions with mx.compile for JIT optimization"""
@@ -185,8 +165,10 @@ class TLBM_MLX:
             vel_y = vel[:, :, 1:2]
 
             # Broadcast for all directions
-            vel_x = mx.broadcast_to(vel_x[:, :, :, None], (self.nx, self.ny, 1, 9))
-            vel_y = mx.broadcast_to(vel_y[:, :, :, None], (self.nx, self.ny, 1, 9))
+            # Get shape from input arrays
+            nx, ny = rho.shape
+            vel_x = mx.broadcast_to(vel_x[:, :, :, None], (nx, ny, 1, 9))
+            vel_y = mx.broadcast_to(vel_y[:, :, :, None], (nx, ny, 1, 9))
 
             # e velocities
             ex = e[:, 0].reshape(1, 1, 1, 9)
@@ -220,25 +202,31 @@ class TLBM_MLX:
         self.compute_equilibrium = compute_equilibrium
 
         @mx.compile
-        def apply_collision(f, g, r, f_eq, g_eq, r_eq, tau_f, tau_t, tau_r):
-            """Apply BGK collision operator"""
-            f_new = f + (f_eq - f) / tau_f
-            g_new = g + (g_eq - g) / tau_t
-            r_new = r + (r_eq - r) / tau_r
-            return f_new, g_new, r_new
-
-        self.apply_collision = apply_collision
-
-        @mx.compile
-        def fused_collide_stream(f, g, r, rho, vel, T, P, w, e, tau_f, tau_t, tau_r, stream_src_idx):
-            """Fused collision and streaming operation for better memory efficiency"""
+        def fused_collide_stream_with_force(f, g, r, rho, vel, T, P, w, e, tau_f, tau_t, tau_r, 
+                                           force_y, stream_src_idx):
+            """Fused collision and streaming with Guo forcing"""
             # Compute equilibrium distributions
             f_eq, g_eq, r_eq = compute_equilibrium(rho, vel, T, P, w, e)
 
-            # Apply collision
+            # Apply BGK collision
             f_post = f + (f_eq - f) / tau_f
             g_post = g + (g_eq - g) / tau_t
             r_post = r + (r_eq - r) / tau_r
+            
+            # Apply Guo forcing to momentum equation (vectorized)
+            # Fi = (1 - 1/(2*tau)) * wi * 3 * (ei · F)
+            force_factor = 1.0 - 0.5 / tau_f
+            
+            # Vectorized computation of forcing term
+            # e[:, 1] is the y-component of lattice velocities
+            # Shape: force_y is (nx, ny), need to broadcast
+            force_y_expanded = mx.expand_dims(force_y, axis=2)  # (nx, ny, 1)
+            e_y = e[:, 1].reshape(1, 1, 9)  # (1, 1, 9)
+            w_reshaped = w.reshape(1, 1, 9)  # (1, 1, 9)
+            
+            # Compute all forcing terms at once
+            Fi = force_factor * 3.0 * w_reshaped * e_y * force_y_expanded
+            f_post = f_post + Fi
 
             # Create new arrays for streamed values
             f_new = mx.zeros_like(f)
@@ -265,17 +253,20 @@ class TLBM_MLX:
 
             return f_new, g_new, r_new
 
-        self.fused_collide_stream = fused_collide_stream
+        self.fused_collide_stream_with_force = fused_collide_stream_with_force
 
     def compute_macroscopic(self):
         """Compute macroscopic quantities from distributions"""
         # Density and velocity from fluid distributions
         self.rho = mx.sum(self.f, axis=2)
+        
+        # Only check physical domain values
+        rho_phys = self.rho[self.phys_x, self.phys_y]
 
-        # Check for density issues
+        # Check for density issues (physical domain only)
         if self.debug and self.step_counter % 100 == 0:
-            rho_min = float(mx.min(self.rho))
-            rho_max = float(mx.max(self.rho))
+            rho_min = float(mx.min(rho_phys))
+            rho_max = float(mx.max(rho_phys))
             if rho_min < 0.5 or rho_max > 2.0:
                 print(f"\n⚠️  Step {self.step_counter}: Density out of bounds!")
                 print(f"   ρ range: [{rho_min:.3f}, {rho_max:.3f}]")
@@ -287,26 +278,32 @@ class TLBM_MLX:
         # Velocity
         self.vel = mx.stack([mom_x / self.rho, mom_y / self.rho], axis=2)
 
-        # Check for velocity issues
+        # Check for velocity issues (physical domain only)
         if self.debug and self.step_counter % 100 == 0:
-            vel_mag = mx.sqrt(self.vel[:, :, 0]**2 + self.vel[:, :, 1]**2)
+            vel_phys = self.vel[self.phys_x, self.phys_y, :]
+            vel_mag = mx.sqrt(vel_phys[:, :, 0]**2 + vel_phys[:, :, 1]**2)
             vel_max = float(mx.max(vel_mag))
             if vel_max > 0.3:  # Mach number should be < 0.3 for LBM
                 print(f"\n⚠️  Step {self.step_counter}: Velocity too high!")
                 print(f"   Max velocity: {vel_max:.3f} (Mach={vel_max/0.577:.3f})")
 
-        # Apply cell resistance
-        resistance_factor = 1.0 - self.config.cell_resistance * self.cell_presence
-        self.vel *= mx.expand_dims(resistance_factor, axis=2)
+        # Apply cell resistance (only in physical domain)
+        if mx.any(self.cell_presence > 0):
+            resistance_factor = mx.ones((self.nx, self.ny))
+            resistance_factor[self.phys_x, self.phys_y] = (
+                1.0 - self.config.cell_resistance * self.cell_presence
+            )
+            self.vel *= mx.expand_dims(resistance_factor, axis=2)
 
         # Temperature and resource
         self.T = mx.sum(self.g, axis=2)
         self.P = mx.sum(self.r, axis=2)
 
-        # Check temperature bounds
+        # Check temperature bounds (physical domain only)
         if self.debug and self.step_counter % 100 == 0:
-            T_min = float(mx.min(self.T))
-            T_max = float(mx.max(self.T))
+            T_phys = self.T[self.phys_x, self.phys_y]
+            T_min = float(mx.min(T_phys))
+            T_max = float(mx.max(T_phys))
             if T_min < -0.1 or T_max > 1.1:
                 print(f"\n⚠️  Step {self.step_counter}: Temperature out of bounds!")
                 print(f"   T range: [{T_min:.3f}, {T_max:.3f}]")
@@ -317,52 +314,68 @@ class TLBM_MLX:
         """[DEPRECATED] Perform streaming using scatter operations - now fused with collision"""
         pass
 
-    def apply_boundaries(self):
-        """Apply boundary conditions"""
-        # Bottom boundary (y=0): hot temperature, resource source, no-slip
-        self.T[:, 0] = self.config.T_hot
-        self.P[:, 0] = 1.0
-        self.vel[:, 0, :] = 0.0  # No-slip boundary
-
-        # Top boundary (y=ny-1): cold temperature, resource sink, no-slip
-        self.T[:, -1] = self.config.T_cold
-        self.P[:, -1] = 0.0
-        self.vel[:, -1, :] = 0.0  # No-slip boundary
-
-        # Apply bounce-back for no-slip walls at top and bottom
-        # Bottom wall bounce-back
-        self.f[:, 0, 2] = self.f[:, 0, 4]  # North -> South
-        self.f[:, 0, 5] = self.f[:, 0, 7]  # NE -> SW
-        self.f[:, 0, 6] = self.f[:, 0, 8]  # NW -> SE
+    def _apply_ghost_boundaries(self):
+        """Set ghost node values to enforce boundary conditions"""
+        # Bottom ghost nodes (y=0): prepare for bounce-back
+        # When streamed, these will enforce no-slip at y=1
+        self.f[:, 0, 2] = self.f[:, 1, 4]   # North at ghost = South at wall
+        self.f[:, 0, 5] = self.f[:, 1, 7]   # NE at ghost = SW at wall  
+        self.f[:, 0, 6] = self.f[:, 1, 8]   # NW at ghost = SE at wall
         
-        # Top wall bounce-back
-        self.f[:, -1, 4] = self.f[:, -1, 2]  # South -> North
-        self.f[:, -1, 7] = self.f[:, -1, 5]  # SW -> NE
-        self.f[:, -1, 8] = self.f[:, -1, 6]  # SE -> NW
+        # Top ghost nodes (y=ny-1): prepare for bounce-back
+        # When streamed, these will enforce no-slip at y=ny-2
+        self.f[:, -1, 4] = self.f[:, -2, 2]  # South at ghost = North at wall
+        self.f[:, -1, 7] = self.f[:, -2, 5]  # SW at ghost = NE at wall
+        self.f[:, -1, 8] = self.f[:, -2, 6]  # SE at ghost = NW at wall
+        
+        # Temperature boundary conditions
+        # Bottom physical boundary (y=1) should have T_hot
+        self.T[:, 1] = self.config.T_hot
+        # Top physical boundary (y=ny-2) should have T_cold  
+        self.T[:, -2] = self.config.T_cold
+        
+        # Resource boundary conditions
+        self.P[:, 1] = 1.0   # Source at bottom
+        self.P[:, -2] = 0.0  # Sink at top
+        
+        # Set ghost node distributions for temperature and resource (vectorized)
+        # Use broadcasting to set all directions at once
+        w_broadcast = self.w.reshape(1, 1, 9)
+        
+        # Bottom boundaries (ghost and physical)
+        self.g[:, 0:2, :] = w_broadcast * self.config.T_hot
+        self.r[:, 0:2, :] = w_broadcast * 1.0
+        
+        # Top boundaries (ghost and physical)
+        self.g[:, -2:, :] = w_broadcast * self.config.T_cold
+        self.r[:, -2:, :] = w_broadcast * 0.0
+        
+        # Handle x-periodic ghost nodes
+        # Left ghost (x=0) = right physical (x=nx-2)
+        self.f[0, :, :] = self.f[-2, :, :]
+        self.g[0, :, :] = self.g[-2, :, :]
+        self.r[0, :, :] = self.r[-2, :, :]
+        
+        # Right ghost (x=nx-1) = left physical (x=1)
+        self.f[-1, :, :] = self.f[1, :, :]
+        self.g[-1, :, :] = self.g[1, :, :]
+        self.r[-1, :, :] = self.r[1, :, :]
 
-        # Update temperature distributions at boundaries
-        for k in range(9):
-            # Bottom
-            self.g[:, 0, k] = self.w[k] * self.config.T_hot
-            self.r[:, 0, k] = self.w[k] * 1.0
-
-            # Top
-            self.g[:, -1, k] = self.w[k] * self.config.T_cold
-            self.r[:, -1, k] = self.w[k] * 0.0
-
-    def apply_buoyancy_force(self):
-        """Apply buoyancy force to velocity field"""
+    def _compute_force_field(self):
+        """Compute buoyancy force field (for Guo forcing)"""
         T_ref = 0.5 * (self.config.T_hot + self.config.T_cold)
-        # Remove grid-size scaling - the physics should be independent of grid resolution
-        force_y = self.config.gravity * self.config.beta * (self.T - T_ref)
-
+        # Compute force only in physical domain
+        self.force_y = mx.zeros((self.nx, self.ny))
+        self.force_y[self.phys_x, self.phys_y] = (
+            self.config.gravity * self.config.beta * 
+            (self.T[self.phys_x, self.phys_y] - T_ref)
+        )
+        
         # Debug force magnitude
         if self.debug and self.step_counter % 500 == 0:
-            force_max = float(mx.max(mx.abs(force_y)))
+            force_phys = self.force_y[self.phys_x, self.phys_y]
+            force_max = float(mx.max(mx.abs(force_phys)))
             print(f"\nStep {self.step_counter}: Max buoyancy force = {force_max:.6f}")
-
-        # Add force to y-velocity
-        self.vel[:, :, 1] = self.vel[:, :, 1] + force_y
 
     def step(self):
         """Perform one complete TLBM step"""
@@ -376,28 +389,30 @@ class TLBM_MLX:
                 self._diagnose_nan_source()
                 return False  # Signal to stop
 
-        # 1. Compute macroscopic quantities
+        # 1. Apply ghost boundary conditions BEFORE streaming
+        self._apply_ghost_boundaries()
+        
+        # 2. Compute macroscopic quantities
         self.compute_macroscopic()
 
-        # 2. Apply buoyancy force
-        self.apply_buoyancy_force()
+        # 3. Compute force field (for Guo forcing)
+        self._compute_force_field()
 
-        # 3. Fused collision and streaming (as recommended by Stavros)
-        self.f, self.g, self.r = self.fused_collide_stream(
+        # 4. Fused collision and streaming with Guo forcing
+        self.f, self.g, self.r = self.fused_collide_stream_with_force(
             self.f, self.g, self.r,
             self.rho, self.vel, self.T, self.P,
             self.w, self.e,
             self.tau_f, self.tau_t, self.tau_r,
+            self.force_y,
             self.stream_src_idx
         )
 
-        # Check distribution sums for conservation
+        # Check distribution sums for conservation (physical domain only)
         if self.debug and self.step_counter % 500 == 0:
-            f_sum = float(mx.sum(self.f))
-            print(f"Step {self.step_counter}: After fused collide-stream, f sum = {f_sum:.6f} (should ≈ {self.nx*self.ny})")
-
-        # 6. Apply boundaries
-        self.apply_boundaries()
+            f_phys = self.f[self.phys_x, self.phys_y, :]
+            f_sum = float(mx.sum(f_phys))
+            print(f"Step {self.step_counter}: After fused collide-stream, f sum = {f_sum:.6f} (should = {self.nx_phys*self.ny_phys})")
 
         return True  # Success
 
@@ -468,12 +483,13 @@ class TLBM_MLX:
 
     def calculate_nusselt(self) -> float:
         """Calculate Nusselt number"""
-        # Temperature gradient at bottom boundary
-        dT_dy = (self.T[:, 1] - self.T[:, 0])
+        # Temperature gradient at bottom boundary (physical domain)
+        # Bottom physical boundary is at y=1, next point is y=2
+        dT_dy = (self.T[self.phys_x, 2] - self.T[self.phys_x, 1])
         avg_gradient = mx.mean(dT_dy)
 
         # Nusselt = heat flux / conductive flux
-        Nu = abs(avg_gradient) * self.ny / (self.config.T_hot - self.config.T_cold)
+        Nu = abs(avg_gradient) * self.ny_phys / (self.config.T_hot - self.config.T_cold)
 
         if self.debug and self.step_counter % 500 == 0:
             print(f"Step {self.step_counter}: Nu = {float(Nu):.3f}, avg gradient = {float(avg_gradient):.6f}")
@@ -481,15 +497,16 @@ class TLBM_MLX:
         return float(Nu)
 
     def get_numpy_fields(self) -> Dict[str, np.ndarray]:
-        """Convert fields to numpy for visualization"""
-        mx.eval(self.T, self.vel, self.P)  # Ensure arrays are evaluated
+        """Convert fields to numpy for visualization (physical domain only)"""
+        mx.eval(self.T, self.vel, self.P, self.rho)  # Ensure arrays are evaluated
 
+        # Extract physical domain only
         return {
-            'T': np.array(self.T),
-            'vx': np.array(self.vel[:, :, 0]),
-            'vy': np.array(self.vel[:, :, 1]),
-            'P': np.array(self.P),
-            'rho': np.array(self.rho)
+            'T': np.array(self.T[self.phys_x, self.phys_y]),
+            'vx': np.array(self.vel[self.phys_x, self.phys_y, 0]),
+            'vy': np.array(self.vel[self.phys_x, self.phys_y, 1]),
+            'P': np.array(self.P[self.phys_x, self.phys_y]),
+            'rho': np.array(self.rho[self.phys_x, self.phys_y])
         }
 
 
@@ -608,7 +625,7 @@ def test_benard_convection():
     # Print parameters
     print(f"Rayleigh number: {config.Ra:.1e}")
     print(f"Prandtl number: {config.Pr:.2f}")
-    print(f"Grid size: 256×128")
+    print(f"Grid size: 128×64")
     print(f"Relaxation times: τ_f={3*config.niu+0.5:.3f}, τ_t={3*config.kappa+0.5:.3f}")
     print(f"Gravity: {config.gravity:.3f}")
     print()
