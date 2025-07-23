@@ -54,13 +54,15 @@ class TLBM_MLX:
         # Initialize distribution functions (with ghost nodes)
         self.f = mx.zeros((self.nx, self.ny, 9), dtype=mx.float32)  # Fluid
         self.g = mx.zeros((self.nx, self.ny, 9), dtype=mx.float32)  # Temperature
-        self.r = mx.zeros((self.nx, self.ny, 9), dtype=mx.float32)  # Resource
+        self.r_A = mx.zeros((self.nx, self.ny, 9), dtype=mx.float32)  # Resource A
+        self.r_B = mx.zeros((self.nx, self.ny, 9), dtype=mx.float32)  # Resource B
 
         # Macroscopic fields (with ghost nodes)
         self.rho = mx.ones((self.nx, self.ny), dtype=mx.float32)
         self.vel = mx.zeros((self.nx, self.ny, 2), dtype=mx.float32)
         self.T = mx.zeros((self.nx, self.ny), dtype=mx.float32)
-        self.P = mx.zeros((self.nx, self.ny), dtype=mx.float32)  # Resource concentration
+        self.P_A = mx.zeros((self.nx, self.ny), dtype=mx.float32)  # Resource A concentration
+        self.P_B = mx.zeros((self.nx, self.ny), dtype=mx.float32)  # Resource B concentration
 
         # Auxiliary fields (physical domain only)
         self.cell_presence = mx.zeros((self.nx_phys, self.ny_phys), dtype=mx.float32)
@@ -125,8 +127,17 @@ class TLBM_MLX:
         # Set physical domain temperature
         self.T[self.phys_x, self.phys_y] = T_phys
 
-        # Resource field: source at bottom of physical domain
-        self.P[self.phys_x, 1] = 1.0  # Bottom of physical domain (y=1)
+        # Resource fields: sources at bottom of physical domain
+        # Split bottom boundary into left and right halves
+        mid_x = self.nx_phys // 2
+        
+        # Apply resource sources based on configuration
+        if self.config.resource_source_left == 'A':
+            self.P_A[1:mid_x+1, 1] = self.config.resource_A_boundary_value  # Left half
+            self.P_B[mid_x+1:self.nx-1, 1] = self.config.resource_B_boundary_value  # Right half
+        else:
+            self.P_B[1:mid_x+1, 1] = self.config.resource_B_boundary_value  # Left half
+            self.P_A[mid_x+1:self.nx-1, 1] = self.config.resource_A_boundary_value  # Right half
 
         # Initialize density in physical domain
         self.rho[self.phys_x, self.phys_y] = 1.0
@@ -135,7 +146,8 @@ class TLBM_MLX:
         for k in range(9):
             self.f[self.phys_x, self.phys_y, k] = self.w[k] * self.rho[self.phys_x, self.phys_y]
             self.g[self.phys_x, self.phys_y, k] = self.w[k] * self.T[self.phys_x, self.phys_y]
-            self.r[self.phys_x, self.phys_y, k] = self.w[k] * self.P[self.phys_x, self.phys_y]
+            self.r_A[self.phys_x, self.phys_y, k] = self.w[k] * self.P_A[self.phys_x, self.phys_y]
+            self.r_B[self.phys_x, self.phys_y, k] = self.w[k] * self.P_B[self.phys_x, self.phys_y]
         
         # Initialize ghost nodes (will be set by boundary conditions)
         self._apply_ghost_boundaries()
@@ -143,11 +155,13 @@ class TLBM_MLX:
         if self.debug:
             print("\nInitial state check (physical domain):")
             T_phys_check = self.T[self.phys_x, self.phys_y]
-            P_phys_check = self.P[self.phys_x, self.phys_y]
+            P_A_phys_check = self.P_A[self.phys_x, self.phys_y]
+            P_B_phys_check = self.P_B[self.phys_x, self.phys_y]
             rho_phys_check = self.rho[self.phys_x, self.phys_y]
             f_phys_check = self.f[self.phys_x, self.phys_y, :]
             print(f"  T range: [{float(mx.min(T_phys_check)):.3f}, {float(mx.max(T_phys_check)):.3f}]")
-            print(f"  P range: [{float(mx.min(P_phys_check)):.3f}, {float(mx.max(P_phys_check)):.3f}]")
+            print(f"  P_A range: [{float(mx.min(P_A_phys_check)):.3f}, {float(mx.max(P_A_phys_check)):.3f}]")
+            print(f"  P_B range: [{float(mx.min(P_B_phys_check)):.3f}, {float(mx.max(P_B_phys_check)):.3f}]")
             print(f"  ρ range: [{float(mx.min(rho_phys_check)):.3f}, {float(mx.max(rho_phys_check)):.3f}]")
             print(f"  f sum: {float(mx.sum(f_phys_check)):.3f} (should be {self.nx_phys * self.ny_phys})")
             print(f"  Total f sum (with ghost): {float(mx.sum(self.f)):.3f}")
@@ -158,7 +172,7 @@ class TLBM_MLX:
         # We'll compile the core computational kernels
 
         @mx.compile
-        def compute_equilibrium(rho, vel, T, P, w, e):
+        def compute_equilibrium(rho, vel, T, P_A, P_B, w, e):
             """Compute equilibrium distributions"""
             # Velocity dot products
             vel_x = vel[:, :, 0:1]
@@ -193,25 +207,30 @@ class TLBM_MLX:
             T_exp = mx.expand_dims(T, axis=2)
             g_eq = w_broadcast * T_exp * (1 + 3*eu)
 
-            # Resource equilibrium
-            P_exp = mx.expand_dims(P, axis=2)
-            r_eq = w_broadcast * P_exp * (1 + 3*eu)
+            # Resource A equilibrium
+            P_A_exp = mx.expand_dims(P_A, axis=2)
+            r_A_eq = w_broadcast * P_A_exp * (1 + 3*eu)
+            
+            # Resource B equilibrium
+            P_B_exp = mx.expand_dims(P_B, axis=2)
+            r_B_eq = w_broadcast * P_B_exp * (1 + 3*eu)
 
-            return f_eq, g_eq, r_eq
+            return f_eq, g_eq, r_A_eq, r_B_eq
 
         self.compute_equilibrium = compute_equilibrium
 
         @mx.compile
-        def fused_collide_stream_with_force(f, g, r, rho, vel, T, P, w, e, tau_f, tau_t, tau_r, 
+        def fused_collide_stream_with_force(f, g, r_A, r_B, rho, vel, T, P_A, P_B, w, e, tau_f, tau_t, tau_r, 
                                            force_y, stream_src_idx):
             """Fused collision and streaming with Guo forcing"""
             # Compute equilibrium distributions
-            f_eq, g_eq, r_eq = compute_equilibrium(rho, vel, T, P, w, e)
+            f_eq, g_eq, r_A_eq, r_B_eq = compute_equilibrium(rho, vel, T, P_A, P_B, w, e)
 
             # Apply BGK collision
             f_post = f + (f_eq - f) / tau_f
             g_post = g + (g_eq - g) / tau_t
-            r_post = r + (r_eq - r) / tau_r
+            r_A_post = r_A + (r_A_eq - r_A) / tau_r
+            r_B_post = r_B + (r_B_eq - r_B) / tau_r
             
             # Apply Guo forcing to momentum equation (vectorized)
             # Fi = (1 - 1/(2*tau)) * wi * 3 * (ei · F)
@@ -231,27 +250,31 @@ class TLBM_MLX:
             # Create new arrays for streamed values
             f_new = mx.zeros_like(f)
             g_new = mx.zeros_like(g)
-            r_new = mx.zeros_like(r)
+            r_A_new = mx.zeros_like(r_A)
+            r_B_new = mx.zeros_like(r_B)
 
             # Stream each direction (fused with collision)
             for k in range(9):
                 # Get post-collision values for this direction
                 f_k = f_post[:, :, k].flatten()
                 g_k = g_post[:, :, k].flatten()
-                r_k = r_post[:, :, k].flatten()
+                r_A_k = r_A_post[:, :, k].flatten()
+                r_B_k = r_B_post[:, :, k].flatten()
 
                 # Gather values from source locations
                 # This gets values FROM the source indices
                 f_streamed = f_k[stream_src_idx[k]]
                 g_streamed = g_k[stream_src_idx[k]]
-                r_streamed = r_k[stream_src_idx[k]]
+                r_A_streamed = r_A_k[stream_src_idx[k]]
+                r_B_streamed = r_B_k[stream_src_idx[k]]
 
                 # Reshape and assign to new arrays
                 f_new[:, :, k] = f_streamed.reshape(f.shape[0], f.shape[1])
                 g_new[:, :, k] = g_streamed.reshape(g.shape[0], g.shape[1])
-                r_new[:, :, k] = r_streamed.reshape(r.shape[0], r.shape[1])
+                r_A_new[:, :, k] = r_A_streamed.reshape(r_A.shape[0], r_A.shape[1])
+                r_B_new[:, :, k] = r_B_streamed.reshape(r_B.shape[0], r_B.shape[1])
 
-            return f_new, g_new, r_new
+            return f_new, g_new, r_A_new, r_B_new
 
         self.fused_collide_stream_with_force = fused_collide_stream_with_force
 
@@ -295,9 +318,10 @@ class TLBM_MLX:
             )
             self.vel *= mx.expand_dims(resistance_factor, axis=2)
 
-        # Temperature and resource
+        # Temperature and resources
         self.T = mx.sum(self.g, axis=2)
-        self.P = mx.sum(self.r, axis=2)
+        self.P_A = mx.sum(self.r_A, axis=2)
+        self.P_B = mx.sum(self.r_B, axis=2)
 
         # Check temperature bounds (physical domain only)
         if self.debug and self.step_counter % 100 == 0:
@@ -335,8 +359,19 @@ class TLBM_MLX:
         self.T[:, -2] = self.config.T_cold
         
         # Resource boundary conditions
-        self.P[:, 1] = 1.0   # Source at bottom
-        self.P[:, -2] = 0.0  # Sink at top
+        # Sources at bottom (split left/right based on config)
+        mid_x = self.nx_phys // 2 + 1  # Adjust for ghost nodes
+        
+        if self.config.resource_source_left == 'A':
+            self.P_A[1:mid_x, 1] = self.config.resource_A_boundary_value  # Left half
+            self.P_B[mid_x:self.nx-1, 1] = self.config.resource_B_boundary_value  # Right half
+        else:
+            self.P_B[1:mid_x, 1] = self.config.resource_B_boundary_value  # Left half
+            self.P_A[mid_x:self.nx-1, 1] = self.config.resource_A_boundary_value  # Right half
+            
+        # Sinks at top for both resources
+        self.P_A[:, -2] = 0.0
+        self.P_B[:, -2] = 0.0
         
         # Set ghost node distributions for temperature and resource (vectorized)
         # Use broadcasting to set all directions at once
@@ -344,22 +379,36 @@ class TLBM_MLX:
         
         # Bottom boundaries (ghost and physical)
         self.g[:, 0:2, :] = w_broadcast * self.config.T_hot
-        self.r[:, 0:2, :] = w_broadcast * 1.0
         
-        # Top boundaries (ghost and physical)
+        # Resource boundaries - need to handle left/right split
+        if self.config.resource_source_left == 'A':
+            self.r_A[1:mid_x, 0:2, :] = w_broadcast * self.config.resource_A_boundary_value
+            self.r_B[mid_x:self.nx-1, 0:2, :] = w_broadcast * self.config.resource_B_boundary_value
+            self.r_B[1:mid_x, 0:2, :] = w_broadcast * 0.0  # No B on left
+            self.r_A[mid_x:self.nx-1, 0:2, :] = w_broadcast * 0.0  # No A on right
+        else:
+            self.r_B[1:mid_x, 0:2, :] = w_broadcast * self.config.resource_B_boundary_value
+            self.r_A[mid_x:self.nx-1, 0:2, :] = w_broadcast * self.config.resource_A_boundary_value
+            self.r_A[1:mid_x, 0:2, :] = w_broadcast * 0.0  # No A on left
+            self.r_B[mid_x:self.nx-1, 0:2, :] = w_broadcast * 0.0  # No B on right
+        
+        # Top boundaries (ghost and physical) - sink for both resources
         self.g[:, -2:, :] = w_broadcast * self.config.T_cold
-        self.r[:, -2:, :] = w_broadcast * 0.0
+        self.r_A[:, -2:, :] = w_broadcast * 0.0
+        self.r_B[:, -2:, :] = w_broadcast * 0.0
         
         # Handle x-periodic ghost nodes
         # Left ghost (x=0) = right physical (x=nx-2)
         self.f[0, :, :] = self.f[-2, :, :]
         self.g[0, :, :] = self.g[-2, :, :]
-        self.r[0, :, :] = self.r[-2, :, :]
+        self.r_A[0, :, :] = self.r_A[-2, :, :]
+        self.r_B[0, :, :] = self.r_B[-2, :, :]
         
         # Right ghost (x=nx-1) = left physical (x=1)
         self.f[-1, :, :] = self.f[1, :, :]
         self.g[-1, :, :] = self.g[1, :, :]
-        self.r[-1, :, :] = self.r[1, :, :]
+        self.r_A[-1, :, :] = self.r_A[1, :, :]
+        self.r_B[-1, :, :] = self.r_B[1, :, :]
 
     def _compute_force_field(self):
         """Compute buoyancy force field (for Guo forcing)"""
@@ -399,9 +448,9 @@ class TLBM_MLX:
         self._compute_force_field()
 
         # 4. Fused collision and streaming with Guo forcing
-        self.f, self.g, self.r = self.fused_collide_stream_with_force(
-            self.f, self.g, self.r,
-            self.rho, self.vel, self.T, self.P,
+        self.f, self.g, self.r_A, self.r_B = self.fused_collide_stream_with_force(
+            self.f, self.g, self.r_A, self.r_B,
+            self.rho, self.vel, self.T, self.P_A, self.P_B,
             self.w, self.e,
             self.tau_f, self.tau_t, self.tau_r,
             self.force_y,
@@ -414,6 +463,10 @@ class TLBM_MLX:
             f_sum = float(mx.sum(f_phys))
             print(f"Step {self.step_counter}: After fused collide-stream, f sum = {f_sum:.6f} (should = {self.nx_phys*self.ny_phys})")
 
+        # Evaluate all fields to prevent computation buildup
+        mx.eval(self.f, self.g, self.r_A, self.r_B,
+                self.rho, self.vel, self.T, self.P_A, self.P_B)
+
         return True  # Success
 
     def _check_for_numerical_issues(self):
@@ -421,11 +474,13 @@ class TLBM_MLX:
         fields_to_check = [
             ('f', self.f),
             ('g', self.g),
-            ('r', self.r),
+            ('r_A', self.r_A),
+            ('r_B', self.r_B),
             ('rho', self.rho),
             ('vel', self.vel),
             ('T', self.T),
-            ('P', self.P)
+            ('P_A', self.P_A),
+            ('P_B', self.P_B)
         ]
 
         for name, field in fields_to_check:
@@ -449,7 +504,8 @@ class TLBM_MLX:
         for k in range(9):
             f_k = self.f[:, :, k]
             g_k = self.g[:, :, k]
-            r_k = self.r[:, :, k]
+            r_A_k = self.r_A[:, :, k]
+            r_B_k = self.r_B[:, :, k]
 
             if mx.any(mx.isnan(f_k)):
                 print(f"NaN in f distribution, direction {k}")
@@ -498,14 +554,35 @@ class TLBM_MLX:
 
     def get_numpy_fields(self) -> Dict[str, np.ndarray]:
         """Convert fields to numpy for visualization (physical domain only)"""
-        mx.eval(self.T, self.vel, self.P, self.rho)  # Ensure arrays are evaluated
-
-        # Extract physical domain only
+        # Extract physical domain
+        vx_phys = self.vel[self.phys_x, self.phys_y, 0]
+        vy_phys = self.vel[self.phys_x, self.phys_y, 1]
+        
+        # Compute vorticity in MLX before conversion
+        # Pad velocities for gradient computation
+        vx_padded = mx.pad(vx_phys, ((1, 1), (1, 1)), mode='edge')
+        vy_padded = mx.pad(vy_phys, ((1, 1), (1, 1)), mode='edge')
+        
+        # Compute gradients using central differences
+        dvx_dy = (vx_padded[1:-1, 2:] - vx_padded[1:-1, :-2]) / 2.0
+        dvy_dx = (vy_padded[2:, 1:-1] - vy_padded[:-2, 1:-1]) / 2.0
+        vorticity = dvy_dx - dvx_dy
+        
+        # Ensure all arrays are evaluated before conversion
+        mx.eval(self.T[self.phys_x, self.phys_y], 
+                vx_phys, vy_phys, vorticity,
+                self.P_A[self.phys_x, self.phys_y], 
+                self.P_B[self.phys_x, self.phys_y],
+                self.rho[self.phys_x, self.phys_y])
+        
+        # Convert to numpy
         return {
             'T': np.array(self.T[self.phys_x, self.phys_y]),
-            'vx': np.array(self.vel[self.phys_x, self.phys_y, 0]),
-            'vy': np.array(self.vel[self.phys_x, self.phys_y, 1]),
-            'P': np.array(self.P[self.phys_x, self.phys_y]),
+            'vx': np.array(vx_phys),
+            'vy': np.array(vy_phys),
+            'vorticity': np.array(vorticity),
+            'P_A': np.array(self.P_A[self.phys_x, self.phys_y]),
+            'P_B': np.array(self.P_B[self.phys_x, self.phys_y]),
             'rho': np.array(self.rho[self.phys_x, self.phys_y])
         }
 
@@ -525,20 +602,21 @@ def visualize_tlbm(tlbm: TLBM_MLX, num_steps: int = 10000, update_interval: int 
     ax1.set_ylabel('y')
     plt.colorbar(im1, ax=ax1)
 
-    # Vorticity plot
-    vort = np.gradient(fields['vy'], axis=0) - np.gradient(fields['vx'], axis=1)
-    im2 = ax2.imshow(vort.T, cmap='RdBu', origin='lower', vmin=-0.1, vmax=0.1)
+    # Vorticity plot (pre-computed in MLX)
+    im2 = ax2.imshow(fields['vorticity'].T, cmap='RdBu', origin='lower', vmin=-0.1, vmax=0.1)
     ax2.set_title('Vorticity')
     ax2.set_xlabel('x')
     ax2.set_ylabel('y')
     plt.colorbar(im2, ax=ax2)
 
-    # Resource plot
-    im3 = ax3.imshow(fields['P'].T, cmap='Greens', origin='lower', vmin=0, vmax=1)
-    ax3.set_title('Resource Concentration')
+    # Resource plot - show both A and B as RGB
+    rgb_resources = np.zeros((fields['P_A'].T.shape[0], fields['P_A'].T.shape[1], 3))
+    rgb_resources[:, :, 0] = np.clip(fields['P_A'].T, 0, 1)  # Red channel for A
+    rgb_resources[:, :, 2] = np.clip(fields['P_B'].T, 0, 1)  # Blue channel for B
+    im3 = ax3.imshow(rgb_resources, origin='lower')
+    ax3.set_title('Resource Distribution (Red=A, Blue=B)')
     ax3.set_xlabel('x')
     ax3.set_ylabel('y')
-    plt.colorbar(im3, ax=ax3)
 
     # Nusselt number evolution
     steps_history = []
@@ -570,12 +648,14 @@ def visualize_tlbm(tlbm: TLBM_MLX, num_steps: int = 10000, update_interval: int 
         # Update temperature
         im1.set_array(fields['T'].T)
 
-        # Update vorticity
-        vort = np.gradient(fields['vy'], axis=0) - np.gradient(fields['vx'], axis=1)
-        im2.set_array(vort.T)
+        # Update vorticity (pre-computed in get_numpy_fields)
+        im2.set_array(fields['vorticity'].T)
 
-        # Update resource
-        im3.set_array(fields['P'].T)
+        # Update resource RGB visualization
+        rgb_resources = np.zeros((fields['P_A'].T.shape[0], fields['P_A'].T.shape[1], 3))
+        rgb_resources[:, :, 0] = np.clip(fields['P_A'].T, 0, 1)  # Red channel for A
+        rgb_resources[:, :, 2] = np.clip(fields['P_B'].T, 0, 1)  # Blue channel for B
+        im3.set_array(rgb_resources)
 
         # Calculate and plot Nusselt number
         nu = tlbm.calculate_nusselt()

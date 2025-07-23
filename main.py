@@ -43,7 +43,7 @@ def create_coupled_visualization(tlbm: TLBM_MLX, cells: DenseCellSystem, config:
 
     # Cell scatter for temperature plot (size based on M)
     cell_pos = cells.get_cell_positions_numpy()
-    M_values, _ = cells.get_cell_values_numpy()
+    M_values, A_values, B_values, E_values = cells.get_cell_values_numpy()
     if len(cell_pos) > 0:
         scatter1 = ax1.scatter(cell_pos[:, 0], cell_pos[:, 1],
                              s=M_values * 50, c='blue',
@@ -51,28 +51,35 @@ def create_coupled_visualization(tlbm: TLBM_MLX, cells: DenseCellSystem, config:
     else:
         scatter1 = ax1.scatter([], [], s=[], c='blue')
 
-    # 2. Vorticity field
-    vort = np.gradient(fields['vy'], axis=0) - np.gradient(fields['vx'], axis=1)
-    im2 = ax2.imshow(vort.T, cmap='RdBu', origin='lower', vmin=-0.1, vmax=0.1)
+    # 2. Vorticity field (pre-computed in MLX)
+    im2 = ax2.imshow(fields.get('vorticity', np.zeros_like(fields['vx'])).T, 
+                     cmap='RdBu', origin='lower', vmin=-0.1, vmax=0.1)
     ax2.set_title('Vorticity')
     ax2.set_xlabel('x')
     ax2.set_ylabel('y')
     plt.colorbar(im2, ax=ax2)
 
-    # 3. Resource concentration with cells
-    im3 = ax3.imshow(fields['P'].T, cmap='Greens', origin='lower',
-                     vmin=0, vmax=1, alpha=0.8)
-    ax3.set_title('Resource Concentration & Cells')
+    # 3. Resource concentration with RGB visualization
+    # Create RGB image: Red = A, Blue = B, Green = 0
+    # Note: imshow expects (height, width, 3) so we transpose the fields
+    rgb_resources = np.zeros((fields['P_A'].T.shape[0], fields['P_A'].T.shape[1], 3))
+    rgb_resources[:, :, 0] = np.clip(fields['P_A'].T, 0, 1)  # Red channel for A
+    rgb_resources[:, :, 2] = np.clip(fields['P_B'].T, 0, 1)  # Blue channel for B
+    
+    im3 = ax3.imshow(rgb_resources, origin='lower', alpha=0.8)
+    ax3.set_title('Resource Distribution (Red=A, Blue=B)')
     ax3.set_xlabel('x')
     ax3.set_ylabel('y')
-    cbar3 = plt.colorbar(im3, ax=ax3)
-    cbar3.set_label('Resource (P)')
 
-    # Cell scatter for resource plot (size based on internal R)
+    # Cell scatter for resource plot (color based on A/B ratio)
     if len(cell_pos) > 0:
-        _, R_values = cells.get_cell_values_numpy()
+        # Create cell colors based on their internal A/B content
+        cell_colors = np.zeros((len(cell_pos), 3))
+        cell_colors[:, 0] = np.clip(A_values / (A_values + B_values + 1e-6), 0, 1)  # Red
+        cell_colors[:, 2] = np.clip(B_values / (A_values + B_values + 1e-6), 0, 1)  # Blue
+        
         scatter3 = ax3.scatter(cell_pos[:, 0], cell_pos[:, 1],
-                             s=R_values * 100, c='darkgreen',
+                             s=E_values * 100, c=cell_colors,
                              alpha=0.7, edgecolors='black', linewidths=1)
     else:
         scatter3 = ax3.scatter([], [], s=[], c='darkgreen')
@@ -109,8 +116,8 @@ def create_coupled_visualization(tlbm: TLBM_MLX, cells: DenseCellSystem, config:
 
     # Add parameter text
     param_text = (f"TLBM: Ra={tlbm.config.Ra:.1e}, Pr={tlbm.config.Pr:.2f}\n"
-                 f"Cells: reaction_rate={cells.config.reaction_rate:.2f}, "
-                 f"division_threshold={cells.config.division_threshold:.1f}")
+                 f"Cells: rate1={cells.config.reaction_rate_1:.2f}, rate2={cells.config.reaction_rate_2:.2f}, "
+                 f"div_thresh={cells.config.division_threshold:.1f}")
     fig.text(0.02, 0.02, param_text, fontsize=9,
              bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
 
@@ -126,37 +133,36 @@ def create_coupled_visualization(tlbm: TLBM_MLX, cells: DenseCellSystem, config:
 
             # Cell step (every N TLBM steps for stability)
             if tlbm.step_counter % config.coupling.cell_update_interval == 0:
-                # Update cells with resource and temperature fields
-                P_field = tlbm.P[tlbm.phys_x, tlbm.phys_y]
-                T_field = tlbm.T[tlbm.phys_x, tlbm.phys_y]
-                cells.step(P_field, T_field)
+                # Update cells with resource fields
+                P_A_field = tlbm.P_A[tlbm.phys_x, tlbm.phys_y]
+                P_B_field = tlbm.P_B[tlbm.phys_x, tlbm.phys_y]
+                cells.step(P_A_field, P_B_field)
 
                 # Apply cell effects to TLBM
                 # 1. Update cell presence for flow resistance
                 tlbm.cell_presence = cells.cell_presence
 
-                # 2. Add heat from metabolism to temperature
-                if mx.any(cells.heat_generation > 0):
-                    T_phys = tlbm.T[tlbm.phys_x, tlbm.phys_y]
-                    T_new = T_phys + cells.heat_generation * config.coupling.heat_addition_factor
-                    tlbm.T[tlbm.phys_x, tlbm.phys_y] = T_new
+                # 2. Extract resources A and B
+                if mx.any(cells.resource_A_extraction > 0):
+                    P_A_phys = tlbm.P_A[tlbm.phys_x, tlbm.phys_y]
+                    P_A_new = mx.maximum(0, P_A_phys - cells.resource_A_extraction * config.coupling.resource_extraction_factor)
+                    tlbm.P_A[tlbm.phys_x, tlbm.phys_y] = P_A_new
 
-                    # Update temperature distributions
+                    # Update resource A distributions
                     for k in range(9):
-                        tlbm.g[tlbm.phys_x, tlbm.phys_y, k] = (
-                            tlbm.w[k] * tlbm.T[tlbm.phys_x, tlbm.phys_y]
+                        tlbm.r_A[tlbm.phys_x, tlbm.phys_y, k] = (
+                            tlbm.w[k] * tlbm.P_A[tlbm.phys_x, tlbm.phys_y]
                         )
 
-                # 3. Extract resources
-                if mx.any(cells.resource_extraction > 0):
-                    P_phys = tlbm.P[tlbm.phys_x, tlbm.phys_y]
-                    P_new = mx.maximum(0, P_phys - cells.resource_extraction * config.coupling.resource_extraction_factor)
-                    tlbm.P[tlbm.phys_x, tlbm.phys_y] = P_new
+                if mx.any(cells.resource_B_extraction > 0):
+                    P_B_phys = tlbm.P_B[tlbm.phys_x, tlbm.phys_y]
+                    P_B_new = mx.maximum(0, P_B_phys - cells.resource_B_extraction * config.coupling.resource_extraction_factor)
+                    tlbm.P_B[tlbm.phys_x, tlbm.phys_y] = P_B_new
 
-                    # Update resource distributions
+                    # Update resource B distributions
                     for k in range(9):
-                        tlbm.r[tlbm.phys_x, tlbm.phys_y, k] = (
-                            tlbm.w[k] * tlbm.P[tlbm.phys_x, tlbm.phys_y]
+                        tlbm.r_B[tlbm.phys_x, tlbm.phys_y, k] = (
+                            tlbm.w[k] * tlbm.P_B[tlbm.phys_x, tlbm.phys_y]
                         )
 
         current_step = frame * update_interval
@@ -171,24 +177,31 @@ def create_coupled_visualization(tlbm: TLBM_MLX, cells: DenseCellSystem, config:
         quiver.set_UVC(fields['vx'][::4, ::4].T,
                       fields['vy'][::4, ::4].T)
 
-        # Update vorticity
-        vort = np.gradient(fields['vy'], axis=0) - np.gradient(fields['vx'], axis=1)
-        im2.set_array(vort.T)
+        # Update vorticity (pre-computed in MLX)
+        im2.set_array(fields.get('vorticity', np.zeros_like(fields['vx'])).T)
 
-        # Update resource
-        im3.set_array(fields['P'].T)
+        # Update resource RGB visualization
+        rgb_resources = np.zeros((fields['P_A'].T.shape[0], fields['P_A'].T.shape[1], 3))
+        rgb_resources[:, :, 0] = np.clip(fields['P_A'].T, 0, 1)  # Red channel for A
+        rgb_resources[:, :, 2] = np.clip(fields['P_B'].T, 0, 1)  # Blue channel for B
+        im3.set_array(rgb_resources)
 
         # Update cell visualizations
         cell_pos = cells.get_cell_positions_numpy()
         if len(cell_pos) > 0:
-            M_values, R_values = cells.get_cell_values_numpy()
+            M_values, A_values, B_values, E_values = cells.get_cell_values_numpy()
 
             # Update scatter plots
             scatter1.set_offsets(cell_pos)
             scatter1.set_sizes(M_values * 50)
 
+            # Update cell colors based on A/B content
+            cell_colors = np.zeros((len(cell_pos), 3))
+            cell_colors[:, 0] = np.clip(A_values / (A_values + B_values + 1e-6), 0, 1)  # Red
+            cell_colors[:, 2] = np.clip(B_values / (A_values + B_values + 1e-6), 0, 1)  # Blue
             scatter3.set_offsets(cell_pos)
-            scatter3.set_sizes(R_values * 100)
+            scatter3.set_sizes(E_values * 100)
+            scatter3.set_facecolors(cell_colors)
         else:
             scatter1.set_offsets(np.empty((0, 2)))
             scatter3.set_offsets(np.empty((0, 2)))
@@ -202,13 +215,25 @@ def create_coupled_visualization(tlbm: TLBM_MLX, cells: DenseCellSystem, config:
         avg_M_history.append(stats['avg_M'] if stats['n_cells'] > 0 else 0)
         nu_history.append(nu)
         
-        # Log division readiness periodically
+        # Log division readiness and resource saturation periodically
         if current_step % 1000 == 0:
+            # Get max resource values to check saturation
+            # Use mx.where to mask dead cells with -inf, then take max
+            if stats['n_cells'] > 0:
+                max_A = float(mx.max(mx.where(cells.alive > 0, cells.A, -float('inf'))))
+                max_B = float(mx.max(mx.where(cells.alive > 0, cells.B, -float('inf'))))
+                max_E = float(mx.max(mx.where(cells.alive > 0, cells.E, -float('inf'))))
+            else:
+                max_A = max_B = max_E = 0
+            
             print(f"\nStep {current_step}: Cells={stats['n_cells']:.0f}, "
                   f"Above threshold={stats['n_above_threshold']:.0f}, "
                   f"On cooldown={stats['n_on_cooldown']:.0f}, "
                   f"Ready to divide={stats['n_ready_to_divide']:.0f}, "
                   f"Max M={stats['max_M']:.2f}")
+            print(f"  Resource maxima: A={max_A:.2f}/{cells.config.max_A}, "
+                  f"B={max_B:.2f}/{cells.config.max_B}, "
+                  f"E={max_E:.2f}/{cells.config.max_E}")
 
         # Update plots
         line_cells.set_data(steps_history, n_cells_history)
@@ -266,30 +291,30 @@ def main():
 
     # Seed initial cells randomly in bottom half
     print("Seeding initial cells...")
-    import random
 
     # Number of initial cells
     n_initial_cells = 20
 
-    # Generate random positions in bottom half of grid
-    initial_positions = []
-    for _ in range(n_initial_cells):
-        x = random.randint(5, config.nx - 5)  # Keep away from edges
-        y = random.randint(5, config.ny // 2)  # Bottom half only
-        initial_positions.append((x, y))
+    # Generate random positions in bottom half of grid using MLX
+    mx.random.seed(42)  # For reproducibility
+    x_positions = mx.random.randint(5, config.nx - 5, shape=(n_initial_cells,))
+    y_positions = mx.random.randint(5, config.ny // 2, shape=(n_initial_cells,))
+    
+    # Convert to list of tuples and remove duplicates
+    initial_positions = list(set(zip(x_positions.tolist(), y_positions.tolist())))
 
-    # Remove duplicates
-    initial_positions = list(set(initial_positions))
-
-    cells.seed_cells(initial_positions, M=0.5, R=0.3)
+    cells.seed_cells(initial_positions, M=0.5, A=0.3, B=0.3)
 
     print(f"Initial cells: {cells.n_cells}")
+    print(f"\nResource configuration:")
+    print(f"- Left source: {config.tlbm.resource_source_left}")
+    print(f"- Right source: {config.tlbm.resource_source_right}")
     print("\nStarting simulation...")
     print("Expected behavior:")
-    print("- Cells will consume resources and divide")
-    print("- Metabolism generates heat, affecting convection")
+    print("- Cells use A + E -> 2E for energy amplification")
+    print("- Cells use B + E -> M for biomass production")
+    print("- Resources A (red) and B (blue) diffuse from bottom")
     print("- Cells provide partial flow resistance")
-    print("- Resource gradients drive cell movement patterns")
     print()
 
     # Run visualization

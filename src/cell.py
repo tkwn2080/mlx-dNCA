@@ -6,6 +6,7 @@ Uses full grid arrays for all properties, enabling fully vectorized operations
 import mlx.core as mx
 import numpy as np
 from typing import Tuple, Dict, Optional
+from functools import partial
 from .config import CellConfig
 
 
@@ -19,12 +20,14 @@ class DenseCellSystem:
         
         # Dense grids for cell properties
         self.M = mx.zeros((nx, ny), dtype=mx.float32)        # Metabolite levels
-        self.R = mx.zeros((nx, ny), dtype=mx.float32)        # Resource levels
+        self.A = mx.zeros((nx, ny), dtype=mx.float32)        # Resource A levels
+        self.B = mx.zeros((nx, ny), dtype=mx.float32)        # Resource B levels
+        self.E = mx.zeros((nx, ny), dtype=mx.float32)        # Energy levels
         self.alive = mx.zeros((nx, ny), dtype=mx.float32)    # 1.0 if alive, 0.0 if dead
         
         # Output fields for TLBM coupling
-        self.heat_generation = mx.zeros((nx, ny), dtype=mx.float32)
-        self.resource_extraction = mx.zeros((nx, ny), dtype=mx.float32)
+        self.resource_A_extraction = mx.zeros((nx, ny), dtype=mx.float32)
+        self.resource_B_extraction = mx.zeros((nx, ny), dtype=mx.float32)
         
         # Moore neighborhood kernel for convolution
         self.neighbor_kernel = mx.array([[1, 1, 1],
@@ -61,24 +64,49 @@ class DenseCellSystem:
         # Random direction selection for each cell
         self.division_direction = mx.zeros((nx, ny), dtype=mx.int32)
         
-    def seed_cells(self, positions: list, M: float = 1.0, R: float = 0.5):
+    def seed_cells(self, positions: list, M: float = 1.0, A: float = 0.3, B: float = 0.3):
         """Seed initial cells at given positions"""
         for x, y in positions:
             if 0 <= x < self.nx and 0 <= y < self.ny:
                 self.M[x, y] = M
-                self.R[x, y] = R
+                self.A[x, y] = A
+                self.B[x, y] = B
+                self.E[x, y] = self.config.initial_E
                 self.alive[x, y] = 1.0
                 
-    def compute_resource_gradients(self, P_field: mx.array) -> Tuple[mx.array, mx.array]:
-        """Compute resource gradients using finite differences"""
-        # Pad for boundary handling
-        P_padded = mx.pad(P_field, ((1, 1), (1, 1)), mode='edge')
         
-        # Central differences
-        grad_x = (P_padded[2:, 1:-1] - P_padded[:-2, 1:-1]) / 2.0
-        grad_y = (P_padded[1:-1, 2:] - P_padded[1:-1, :-2]) / 2.0
+    def _compute_reactions(self, A, B, E, alive):
+        """Compute metabolic reactions"""
+        # Step 1: A + E -> 2E (energy amplification)
+        reaction_1_amount = self.config.reaction_rate_1 * A * E * alive
         
-        return grad_x, grad_y
+        # Step 2: B + E -> M (biomass production)
+        reaction_2_amount = self.config.reaction_rate_2 * B * E * alive
+        
+        return reaction_1_amount, reaction_2_amount
+    
+    def _apply_diffusion(self, A_alive, B_alive, alive, diffusion_kernel):
+        """Apply resource diffusion between cells"""
+        # Stack A and B into a multi-channel array for batched convolution
+        # Shape: (1, nx, ny, 2) - batch=1, height=nx, width=ny, channels=2
+        AB_stacked = mx.stack([A_alive, B_alive], axis=-1).reshape(1, self.nx, self.ny, 2)
+        
+        # Prepare kernel for multi-channel convolution
+        # Original kernel shape: (3, 3)
+        # Need shape: (out_channels=2, kernel_h=3, kernel_w=3, in_channels=2)
+        # We want each channel processed independently, so create diagonal filter
+        kernel_2ch = mx.zeros((2, 3, 3, 2))
+        kernel_2ch[0, :, :, 0] = diffusion_kernel  # A channel
+        kernel_2ch[1, :, :, 1] = diffusion_kernel  # B channel
+        
+        # Apply batched convolution
+        AB_diffusion = mx.conv2d(AB_stacked, kernel_2ch, padding=1)
+        
+        # Unstack and apply alive mask
+        A_diffusion = AB_diffusion[0, :, :, 0] * alive
+        B_diffusion = AB_diffusion[0, :, :, 1] * alive
+        
+        return A_diffusion, B_diffusion
         
     def count_neighbors(self) -> mx.array:
         """Count living neighbors for each cell using convolution"""
@@ -93,88 +121,75 @@ class DenseCellSystem:
         # Reshape back to 2D (remove batch and channel dimensions)
         return neighbor_count.squeeze()
         
-    def step(self, P_field: mx.array, T_field: mx.array = None):
+    def step(self, P_A_field: mx.array, P_B_field: mx.array):
         """Perform one cell update step using dense operations"""
         
         # Generate stochastic update mask (currently unused - kept for potential future use)
         update_mask = mx.random.uniform(shape=(self.nx, self.ny)) < 0.5
         
-        # 1. Resource ingestion based on concentration difference (deterministic - passive diffusion)
-        ingestion = self.config.ingestion_rate * mx.maximum(0, P_field - self.R)
-        ingestion = ingestion * self.alive  # Only living cells, but deterministic
+        # 1. Resource ingestion with saturation limits (deterministic - passive diffusion)
+        # Calculate headroom (how much more we can take before saturation)
+        headroom_A = mx.maximum(0, self.config.max_A - self.A)
+        headroom_B = mx.maximum(0, self.config.max_B - self.B)
         
-        # 2. Autocatalytic reaction: M + R -> 2M (deterministic - core metabolism)
-        # Temperature-dependent reaction rate (Q10 ~ 2, i.e., doubles every 10°C)
-        if T_field is not None:
-            # Assuming T_field is normalized 0-1, where 0.5 is "normal" temperature
-            # Using exponential relationship: rate = base_rate * exp(k * (T - T_ref))
-            # For Q10=2: k = ln(2)/10 ≈ 0.0693 per 0.1 normalized units
-            temp_factor = mx.exp(0.693 * (T_field - 0.5))  # Q10 = 2
-            effective_rate = self.config.reaction_rate * temp_factor
-        else:
-            effective_rate = self.config.reaction_rate
-            
-        reaction_amount = effective_rate * self.M * self.R * self.alive  # No stochastic mask
+        # Gradient-driven uptake
+        gradient_A = mx.maximum(0, P_A_field - self.A)
+        gradient_B = mx.maximum(0, P_B_field - self.B)
         
-        # 3. Maintenance cost (ALWAYS happens - no stochastic mask)
-        # Temperature-dependent maintenance: increases above critical temperature
-        if T_field is not None:
-            # Calculate heat stress factor
-            # Below critical temp: factor = 1
-            # Above critical temp: factor increases linearly up to heat_stress_factor
-            heat_stress = mx.maximum(0, (T_field - self.config.critical_temp) / (1.0 - self.config.critical_temp))
-            maintenance_factor = 1.0 + heat_stress * (self.config.heat_stress_factor - 1.0)
-        else:
-            maintenance_factor = 1.0
-            
-        maintenance_cost = self.config.maintenance_rate * maintenance_factor * self.alive
+        # Take minimum of gradient desire and headroom
+        ingestion_A = self.config.ingestion_rate * mx.minimum(gradient_A, headroom_A) * self.alive
+        ingestion_B = self.config.ingestion_rate * mx.minimum(gradient_B, headroom_B) * self.alive
+        
+        # 2. Metabolic reactions (using compiled function)
+        reaction_1_amount, reaction_2_amount = self._compute_reactions(
+            self.A, self.B, self.E, self.alive
+        )
+        
+        # 3. Maintenance cost (simple, no temperature dependence)
+        maintenance_cost = self.config.maintenance_rate * self.alive
         
         # 4. Update internal states
-        self.R = self.R + ingestion - reaction_amount
-        self.M = self.M + reaction_amount - maintenance_cost
+        self.A = self.A + ingestion_A - reaction_1_amount
+        self.B = self.B + ingestion_B - reaction_2_amount
+        self.E = self.E + reaction_1_amount - reaction_2_amount  # Gain from reaction 1, consumed in reaction 2
+        self.M = self.M + reaction_2_amount - maintenance_cost
+        
+        # Apply saturation limits
+        self.E = mx.minimum(self.E, self.config.max_E)
         
         # 4b. Resource sharing between adjacent cells (passive diffusion)
-        # Only share R between living cells
-        R_alive = self.R * self.alive
+        # Share both A and B between living cells
+        A_alive = self.A * self.alive
+        B_alive = self.B * self.alive
         
-        # Compute diffusion using convolution
-        R_4d = R_alive.reshape(1, self.nx, self.ny, 1)  # NHWC format
-        diffusion_kernel_4d = self.diffusion_kernel.reshape(1, 3, 3, 1)
+        # Compute diffusion using compiled function with batched convolution
+        A_diffusion, B_diffusion = self._apply_diffusion(
+            A_alive, B_alive, self.alive, self.diffusion_kernel
+        )
         
-        # Apply diffusion (Laplacian)
-        R_diffusion = mx.conv2d(R_4d, diffusion_kernel_4d, padding=1).squeeze()
-        
-        # Apply diffusion with a rate, only to living cells
-        self.R = self.R + self.config.diffusion_rate * R_diffusion * self.alive
+        # Apply diffusion with rate
+        self.A = self.A + self.config.diffusion_rate * A_diffusion
+        self.B = self.B + self.config.diffusion_rate * B_diffusion
         
         # Ensure non-negative
-        self.R = mx.maximum(0, self.R)
+        self.A = mx.maximum(0, self.A)
+        self.B = mx.maximum(0, self.B)
+        self.E = mx.maximum(0, self.E)
         
-        # 5. Generate heat from metabolism
-        reaction_heat = self.config.heat_per_reaction * reaction_amount
+        # 5. Resource extraction (rate per step)
+        self.resource_A_extraction = ingestion_A
+        self.resource_B_extraction = ingestion_B
         
-        # Non-linear heat generation from maintenance
-        # At normal maintenance: normal heat
-        # At high maintenance (heat stress): disproportionately more heat (positive feedback)
-        if T_field is not None:
-            # Heat generation increases quadratically with maintenance factor
-            heat_scaling = maintenance_factor ** 1.5  # Non-linear scaling
-            maintenance_heat = self.config.heat_per_maintenance * maintenance_cost * heat_scaling
-        else:
-            maintenance_heat = self.config.heat_per_maintenance * maintenance_cost
-            
-        self.heat_generation = reaction_heat + maintenance_heat
-        
-        # 6. Resource extraction (rate per step)
-        self.resource_extraction = ingestion
-        
-        # 7. Handle cell death
-        self.alive = mx.where((self.M >= self.config.death_threshold) & (self.M > 0), 
+        # 6. Handle cell death (from M or E depletion)
+        self.alive = mx.where((self.M >= self.config.death_threshold_M) & 
+                             (self.E >= self.config.death_threshold_E), 
                              self.alive, 0.0)
         
         # Dead cells lose their contents
         self.M = self.M * self.alive
-        self.R = self.R * self.alive
+        self.A = self.A * self.alive
+        self.B = self.B * self.alive
+        self.E = self.E * self.alive
         
         # 8. Handle cell division
         self._handle_division()
@@ -182,8 +197,10 @@ class DenseCellSystem:
         # 9. Update division cooldown (decrements by 1 each step)
         self.division_cooldown = mx.maximum(0, self.division_cooldown - 1)
         
-        # Ensure arrays are evaluated
-        mx.eval(self.alive, self.heat_generation, self.resource_extraction)
+        # Ensure all arrays are evaluated to prevent computation buildup
+        mx.eval(self.M, self.A, self.B, self.E, self.alive,
+                self.resource_A_extraction, self.resource_B_extraction,
+                self.division_cooldown)
         
     def _handle_division(self):
         """Handle cell division with conflict detection for true binary fission"""
@@ -265,15 +282,21 @@ class DenseCellSystem:
             if mx.any(valid_offspring):
                 # Get parent resources
                 parent_M_4d = (self.M * dividing_in_dir).reshape(1, self.nx, self.ny, 1)
-                parent_R_4d = (self.R * dividing_in_dir).reshape(1, self.nx, self.ny, 1)
+                parent_A_4d = (self.A * dividing_in_dir).reshape(1, self.nx, self.ny, 1)
+                parent_B_4d = (self.B * dividing_in_dir).reshape(1, self.nx, self.ny, 1)
+                parent_E_4d = (self.E * dividing_in_dir).reshape(1, self.nx, self.ny, 1)
                 
                 # Calculate offspring resources
                 m_offspring = mx.conv2d(parent_M_4d, kernel_4d, padding=1).squeeze()
-                r_offspring = mx.conv2d(parent_R_4d, kernel_4d, padding=1).squeeze()
+                a_offspring = mx.conv2d(parent_A_4d, kernel_4d, padding=1).squeeze()
+                b_offspring = mx.conv2d(parent_B_4d, kernel_4d, padding=1).squeeze()
+                e_offspring = mx.conv2d(parent_E_4d, kernel_4d, padding=1).squeeze()
                 
                 # Place offspring (50% of parent's resources)
                 self.M = mx.where(valid_offspring, m_offspring * 0.5, self.M)
-                self.R = mx.where(valid_offspring, r_offspring * 0.5, self.R)
+                self.A = mx.where(valid_offspring, a_offspring * 0.5, self.A)
+                self.B = mx.where(valid_offspring, b_offspring * 0.5, self.B)
+                self.E = mx.where(valid_offspring, e_offspring * 0.5, self.E)
                 self.alive = mx.where(valid_offspring, 1.0, self.alive)
                 self.division_cooldown = mx.where(valid_offspring, self.config.offspring_cooldown, self.division_cooldown)
                 
@@ -285,57 +308,78 @@ class DenseCellSystem:
                 # Update parent resources and mark as divided (keep 50%)
                 successful_parents = dividing_in_dir & parent_success
                 self.M = mx.where(successful_parents, self.M * 0.5, self.M)
-                self.R = mx.where(successful_parents, self.R * 0.5, self.R)
+                self.A = mx.where(successful_parents, self.A * 0.5, self.A)
+                self.B = mx.where(successful_parents, self.B * 0.5, self.B)
+                self.E = mx.where(successful_parents, self.E * 0.5, self.E)
                 self.division_cooldown = mx.where(successful_parents, self.config.division_cooldown, self.division_cooldown)
                 parent_divided = parent_divided | successful_parents
         
-        # Phase 3: Handle conflicts (minimal sequential processing)
+        # Phase 3: Handle conflicts (using MLX operations)
         if mx.any(has_conflict):
-            # Convert to numpy for conflict resolution
-            conflict_positions = np.argwhere(np.array(has_conflict, copy=False))
+            # For each conflicted position, we need to randomly select one parent
+            # Since MLX doesn't have argwhere, we'll use a different approach
             
-            for cx, cy in conflict_positions:
-                # Find all parents trying to divide into this position
-                potential_parents = []
+            # Create random priorities for each dividing cell
+            random_priorities = mx.random.uniform(shape=(self.nx, self.ny))
+            random_priorities = mx.where(will_divide & (~parent_divided), random_priorities, -1.0)
+            
+            # For each direction, check which parent has highest priority for each conflict position
+            for dir_idx in range(8):
+                dividing_in_dir = will_divide & (random_dirs == dir_idx) & (~parent_divided)
                 
-                for dx, dy in [(0, 1), (-1, 0), (0, -1), (1, 0), (-1, -1), (1, -1), (-1, 1), (1, 1)]:
-                    px, py = cx - dx, cy - dy
-                    if 0 <= px < self.nx and 0 <= py < self.ny:
-                        # Convert to numpy arrays for indexing
-                        will_divide_np = np.array(will_divide, copy=False)
-                        parent_divided_np = np.array(parent_divided, copy=False)
-                        random_dirs_np = np.array(random_dirs, copy=False)
-                        
-                        if will_divide_np[px, py] and not parent_divided_np[px, py]:
-                            # Check if this parent wants to divide toward (cx, cy)
-                            dir_map = {(0, -1): 0, (1, 0): 1, (0, 1): 2, (-1, 0): 3,
-                                      (1, -1): 4, (1, 1): 5, (-1, 1): 6, (-1, -1): 7}
-                            if (dx, dy) in dir_map and random_dirs_np[px, py] == dir_map[(dx, dy)]:
-                                potential_parents.append((px, py))
+                if not mx.any(dividing_in_dir):
+                    continue
+                    
+                # Get parent priorities for this direction
+                parent_priority_4d = (random_priorities * dividing_in_dir).reshape(1, self.nx, self.ny, 1).astype(mx.float32)
+                kernel_4d = self.division_kernels[dir_idx].reshape(1, 3, 3, 1)
                 
-                # Randomly select one parent
-                if potential_parents:
-                    import random
-                    px, py = random.choice(potential_parents)
+                # Find max priority at each offspring position
+                offspring_max_priority = mx.conv2d(parent_priority_4d, kernel_4d, padding=1).squeeze()
+                
+                # Check if this parent wins the conflict (has max priority)
+                # Reverse convolution to find which parents match the max priority
+                max_priority_4d = offspring_max_priority.reshape(1, self.nx, self.ny, 1).astype(mx.float32)
+                reverse_kernel = self.division_kernels[7-dir_idx].reshape(1, 3, 3, 1)
+                parent_matches_max = mx.conv2d(max_priority_4d, reverse_kernel, padding=1).squeeze()
+                
+                # Parent wins if their priority matches the max at offspring position
+                winning_parents = dividing_in_dir & (mx.abs(random_priorities - parent_matches_max) < 1e-6)
+                
+                # Only process conflicts
+                valid_conflicts = winning_parents & has_conflict
+                
+                if mx.any(valid_conflicts):
+                    # Get parent resources
+                    parent_M_4d = (self.M * valid_conflicts).reshape(1, self.nx, self.ny, 1)
+                    parent_A_4d = (self.A * valid_conflicts).reshape(1, self.nx, self.ny, 1)
+                    parent_B_4d = (self.B * valid_conflicts).reshape(1, self.nx, self.ny, 1)
+                    parent_E_4d = (self.E * valid_conflicts).reshape(1, self.nx, self.ny, 1)
                     
-                    # Convert indices to Python int for MLX indexing
-                    cx_int, cy_int = int(cx), int(cy)
-                    px_int, py_int = int(px), int(py)
+                    # Calculate offspring resources
+                    m_offspring = mx.conv2d(parent_M_4d, kernel_4d, padding=1).squeeze()
+                    a_offspring = mx.conv2d(parent_A_4d, kernel_4d, padding=1).squeeze()
+                    b_offspring = mx.conv2d(parent_B_4d, kernel_4d, padding=1).squeeze()
+                    e_offspring = mx.conv2d(parent_E_4d, kernel_4d, padding=1).squeeze()
                     
-                    # Perform division (50/50 split)
-                    self.M[cx_int, cy_int] = float(self.M[px_int, py_int]) * 0.5
-                    self.R[cx_int, cy_int] = float(self.R[px_int, py_int]) * 0.5
-                    self.alive[cx_int, cy_int] = 1.0
-                    self.division_cooldown[cx_int, cy_int] = self.config.offspring_cooldown
+                    # Find valid offspring positions
+                    offspring_pos = (offspring_max_priority > 0) & has_conflict
                     
-                    # Update parent (keep 50%)
-                    self.M[px_int, py_int] = float(self.M[px_int, py_int]) * 0.5
-                    self.R[px_int, py_int] = float(self.R[px_int, py_int]) * 0.5
-                    self.division_cooldown[px_int, py_int] = self.config.division_cooldown
-                    # Update parent_divided - create a boolean mask and OR it
-                    mask = mx.zeros((self.nx, self.ny), dtype=mx.bool_)
-                    mask[px_int, py_int] = True
-                    parent_divided = parent_divided | mask
+                    # Place offspring
+                    self.M = mx.where(offspring_pos, m_offspring * 0.5, self.M)
+                    self.A = mx.where(offspring_pos, a_offspring * 0.5, self.A)
+                    self.B = mx.where(offspring_pos, b_offspring * 0.5, self.B)
+                    self.E = mx.where(offspring_pos, e_offspring * 0.5, self.E)
+                    self.alive = mx.where(offspring_pos, 1.0, self.alive)
+                    self.division_cooldown = mx.where(offspring_pos, self.config.offspring_cooldown, self.division_cooldown)
+                    
+                    # Update parents
+                    self.M = mx.where(winning_parents, self.M * 0.5, self.M)
+                    self.A = mx.where(winning_parents, self.A * 0.5, self.A)
+                    self.B = mx.where(winning_parents, self.B * 0.5, self.B)
+                    self.E = mx.where(winning_parents, self.E * 0.5, self.E)
+                    self.division_cooldown = mx.where(winning_parents, self.config.division_cooldown, self.division_cooldown)
+                    parent_divided = parent_divided | winning_parents
         
         
     def get_stats(self) -> Dict[str, float]:
@@ -346,9 +390,13 @@ class DenseCellSystem:
             return {
                 'n_cells': 0,
                 'total_M': 0.0,
-                'total_R': 0.0,
+                'total_A': 0.0,
+                'total_B': 0.0,
+                'total_E': 0.0,
                 'avg_M': 0.0,
-                'avg_R': 0.0,
+                'avg_A': 0.0,
+                'avg_B': 0.0,
+                'avg_E': 0.0,
                 'n_above_threshold': 0,
                 'n_on_cooldown': 0,
                 'max_M': 0.0,
@@ -356,7 +404,9 @@ class DenseCellSystem:
             }
             
         total_M = float(mx.sum(self.M))
-        total_R = float(mx.sum(self.R))
+        total_A = float(mx.sum(self.A))
+        total_B = float(mx.sum(self.B))
+        total_E = float(mx.sum(self.E))
         
         # Division readiness stats
         above_threshold = (self.M > self.config.division_threshold) & (self.alive > 0)
@@ -371,9 +421,13 @@ class DenseCellSystem:
         return {
             'n_cells': n_cells,
             'total_M': total_M,
-            'total_R': total_R,
+            'total_A': total_A,
+            'total_B': total_B,
+            'total_E': total_E,
             'avg_M': total_M / n_cells,
-            'avg_R': total_R / n_cells,
+            'avg_A': total_A / n_cells,
+            'avg_B': total_B / n_cells,
+            'avg_E': total_E / n_cells,
             'n_above_threshold': float(mx.sum(above_threshold)),
             'n_on_cooldown': float(mx.sum(on_cooldown)),
             'max_M': float(mx.max(self.M)),
@@ -386,18 +440,22 @@ class DenseCellSystem:
         positions = np.argwhere(alive_np > 0)
         return positions
         
-    def get_cell_values_numpy(self) -> Tuple[np.ndarray, np.ndarray]:
-        """Get M and R values for living cells"""
+    def get_cell_values_numpy(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Get M, A, B, and E values for living cells"""
         alive_np = np.array(self.alive)
         M_np = np.array(self.M)
-        R_np = np.array(self.R)
+        A_np = np.array(self.A)
+        B_np = np.array(self.B)
+        E_np = np.array(self.E)
         
         # Get values only for living cells
         alive_mask = alive_np > 0
         M_values = M_np[alive_mask]
-        R_values = R_np[alive_mask]
+        A_values = A_np[alive_mask]
+        B_values = B_np[alive_mask]
+        E_values = E_np[alive_mask]
         
-        return M_values, R_values
+        return M_values, A_values, B_values, E_values
         
     @property
     def cell_presence(self):
